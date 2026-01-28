@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# App data
+data/
+
+# Credentials
+google_cloud.json
