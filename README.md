@@ -10,7 +10,7 @@ history and outputs persisted to disk.
 ```
 python -m venv .venv
 source .venv/bin/activate
-pip install streamlit google-genai
+pip install -r requirements.txt
 ```
 
 2. Authenticate with ADC (service account or user login) and set optional project/location:
@@ -21,7 +21,13 @@ export GOOGLE_CLOUD_PROJECT="YOUR_PROJECT"   # optional
 export GOOGLE_CLOUD_LOCATION="us-central1"   # optional
 ```
 
-3. Run the app:
+3. If using fal.ai Hunyuan Image, set the API key:
+
+```
+export FAL_KEY="YOUR_FAL_KEY"
+```
+
+4. Run the app:
 
 ```
 streamlit run app.py
