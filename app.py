@@ -1,374 +1,29 @@
-import base64
-import json
-import mimetypes
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 from uuid import uuid4
 
-import fal_client
-import requests
 import streamlit as st
-from google import genai
 from google.genai import types
 
+from config import DATA_DIR, DEFAULT_CREDENTIALS_PATH, FAL_MODELS, JOBS_DIR
+from examples import apply_example_input, load_example_inputs
+from fal_provider import parse_optional_int, run_fal_instruct_edit
+from io_utils import save_example_images, save_uploaded_images
 from storage import append_job, load_history, update_job
-
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-JOBS_DIR = DATA_DIR / "jobs"
-DEFAULT_CREDENTIALS_PATH = BASE_DIR / "google_cloud.json"
-EXAMPLES_DIR = BASE_DIR / "example_inputs"
-FAL_MODELS = {
-    "fal-ai/hunyuan-image/v3/instruct/edit": {
-        "label": "Hunyuan Image Edit",
-        "image_sizes": [
-            "auto",
-            "square_hd",
-            "square",
-            "portrait_4_3",
-            "portrait_16_9",
-            "landscape_4_3",
-            "landscape_16_9",
-        ],
-        "output_formats": ["png", "jpeg"],
-        "guidance_default": 3.5,
-        "max_input_images": 2,
-    },
-    "fal-ai/qwen-image-edit-2511": {
-        "label": "Qwen Image Edit 2511",
-        "image_sizes": [
-            "square_hd",
-            "square",
-            "portrait_4_3",
-            "portrait_16_9",
-            "landscape_4_3",
-            "landscape_16_9",
-        ],
-        "output_formats": ["png", "jpeg", "webp"],
-        "guidance_default": 4.5,
-        "max_input_images": None,
-    },
-}
-
-
-def guess_mime(filename: str, default: str = "application/octet-stream") -> str:
-    mime, _ = mimetypes.guess_type(filename)
-    return mime or default
-
-
-def save_uploaded_images(job_dir: Path, uploads: List[st.runtime.uploaded_file_manager.UploadedFile]) -> List[Dict[str, Any]]:
-    inputs_dir = job_dir / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for upload in uploads:
-        filename = upload.name
-        mime = upload.type or guess_mime(filename, "image/png")
-        payload = upload.getvalue()
-        target_path = inputs_dir / filename
-        target_path.write_bytes(payload)
-        saved.append(
-            {
-                "filename": filename,
-                "path": str(target_path.relative_to(DATA_DIR)),
-                "mime_type": mime,
-                "size_bytes": len(payload),
-            }
-        )
-    return saved
-
-
-def save_example_images(job_dir: Path, example_images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    inputs_dir = job_dir / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for image in example_images:
-        source_path = Path(image["source_path"])
-        if not source_path.exists():
-            continue
-        target_path = inputs_dir / image["filename"]
-        target_path.write_bytes(source_path.read_bytes())
-        saved.append(
-            {
-                "filename": image["filename"],
-                "path": str(target_path.relative_to(DATA_DIR)),
-                "mime_type": image["mime_type"],
-                "size_bytes": target_path.stat().st_size,
-            }
-        )
-    return saved
-
-
-def load_example_inputs() -> List[Dict[str, Any]]:
-    examples: List[Dict[str, Any]] = []
-    if not EXAMPLES_DIR.exists():
-        return examples
-    for child in sorted(EXAMPLES_DIR.iterdir()):
-        if not child.is_dir():
-            continue
-        prompt_path = child / "prompt.txt"
-        prompt_text = ""
-        if prompt_path.exists():
-            prompt_text = prompt_path.read_text(encoding="utf-8")
-        def image_sort_key(path: Path) -> Tuple[int, int, str]:
-            stem = path.stem.strip()
-            if stem.isdigit():
-                return (0, int(stem), path.name.lower())
-            return (1, 0, path.name.lower())
-
-        image_paths = [
-            path
-            for path in sorted(child.iterdir(), key=image_sort_key)
-            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-        ]
-        images = [
-            {
-                "source_path": str(path),
-                "filename": path.name,
-                "mime_type": guess_mime(path.name, "image/png"),
-            }
-            for path in image_paths
-        ]
-        examples.append(
-            {
-                "id": child.name,
-                "label": child.name,
-                "prompt": prompt_text,
-                "images": images,
-            }
-        )
-    return examples
-
-
-def apply_example_input(example: Dict[str, Any]) -> None:
-    st.session_state["prompt_text"] = example.get("prompt", "")
-    st.session_state["example_images"] = example.get("images", [])
-    st.session_state["example_label"] = example.get("label", "")
-
-
-def build_parts(prompt: str, input_images: List[Dict[str, Any]]) -> List[types.Part]:
-    parts: List[types.Part] = []
-    if prompt.strip():
-        parts.append(types.Part.from_text(text=prompt))
-    for image in input_images:
-        image_path = DATA_DIR / image["path"]
-        image_bytes = image_path.read_bytes()
-        parts.append(
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=image["mime_type"],
-            )
-        )
-    return parts
-
-
-def build_config(
-    temperature: float,
-    top_p: float,
-    max_output_tokens: int,
-    response_modalities: List[str],
-    aspect_ratio: str,
-    image_size: str,
-    output_mime_type: str,
-) -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        temperature=temperature,
-        top_p=top_p,
-        max_output_tokens=max_output_tokens,
-        response_modalities=response_modalities,
-        safety_settings=[
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-        ],
-        image_config=types.ImageConfig(
-            aspect_ratio=aspect_ratio,
-            image_size=image_size,
-            output_mime_type=output_mime_type,
-        ),
-    )
-
-
-def parse_response(response: types.GenerateContentResponse, job_dir: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    outputs_dir = job_dir / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    text_parts: List[str] = []
-    image_outputs: List[Dict[str, Any]] = []
-
-    for candidate in response.candidates or []:
-        content = candidate.content
-        if not content:
-            continue
-        for part in content.parts or []:
-            if getattr(part, "text", None):
-                text_parts.append(part.text)
-                continue
-            inline_data = getattr(part, "inline_data", None)
-            if inline_data and getattr(inline_data, "data", None):
-                mime = inline_data.mime_type or "image/png"
-                ext = mime.split("/")[-1] or "png"
-                filename = f"output_{len(image_outputs) + 1}.{ext}"
-                target_path = outputs_dir / filename
-                target_path.write_bytes(inline_data.data)
-                image_outputs.append(
-                    {
-                        "path": str(target_path.relative_to(DATA_DIR)),
-                        "mime_type": mime,
-                    }
-                )
-                continue
-            file_data = getattr(part, "file_data", None)
-            if file_data and getattr(file_data, "file_uri", None):
-                text_parts.append(f"[file_uri] {file_data.file_uri}")
-
-    return "\n".join(text_parts).strip(), image_outputs
-
-
-def save_response_debug(response: types.GenerateContentResponse, job_dir: Path) -> str:
-    outputs_dir = job_dir / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    target_path = outputs_dir / "response.json"
-    text = ""
-    try:
-        if hasattr(response, "to_json"):
-            text = response.to_json()
-        elif hasattr(response, "model_dump_json"):
-            text = response.model_dump_json()
-        elif hasattr(response, "json"):
-            text = response.json()
-        else:
-            text = repr(response)
-    except Exception as exc:  # noqa: BLE001
-        text = f"Failed to serialize response: {exc}\n\nrepr:\n{repr(response)}"
-    target_path.write_text(text, encoding="utf-8")
-    return str(target_path.relative_to(DATA_DIR))
-
-
-def save_json_debug(data: Dict[str, Any], job_dir: Path) -> str:
-    outputs_dir = job_dir / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    target_path = outputs_dir / "response.json"
-    target_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    return str(target_path.relative_to(DATA_DIR))
-
-
-def build_data_uri(image_path: Path, mime_type: str) -> str:
-    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
-def parse_optional_int(value: str) -> Optional[int]:
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError as exc:
-        raise ValueError("Seed must be an integer.") from exc
-
-
-def normalize_fal_result(result: Any) -> Dict[str, Any]:
-    if isinstance(result, dict):
-        return result
-    if hasattr(result, "data"):
-        payload: Dict[str, Any] = {"data": result.data}
-        if hasattr(result, "request_id"):
-            payload["request_id"] = result.request_id
-        return payload
-    if hasattr(result, "model_dump"):
-        return result.model_dump()
-    if hasattr(result, "__dict__"):
-        return dict(result.__dict__)
-    return {"result": repr(result)}
-
-
-def run_fal_instruct_edit(
-    model_id: str,
-    prompt: str,
-    input_images: List[Dict[str, Any]],
-    image_size: str,
-    num_images: int,
-    guidance_scale: float,
-    seed: Optional[int],
-    enable_safety_checker: bool,
-    output_format: str,
-    job_dir: Path,
-) -> Tuple[str, List[Dict[str, Any]], str]:
-    fal_key = os.environ.get("FAL_KEY", "")
-    if not fal_key:
-        raise RuntimeError("FAL_KEY environment variable is required for fal.ai requests.")
-
-    image_urls = []
-    for image in input_images:
-        image_path = DATA_DIR / image["path"]
-        image_urls.append(build_data_uri(image_path, image["mime_type"]))
-
-    payload = {
-        "prompt": prompt,
-        "image_urls": image_urls,
-        "image_size": image_size,
-        "num_images": int(num_images),
-        "guidance_scale": float(guidance_scale),
-        "enable_safety_checker": bool(enable_safety_checker),
-        "output_format": output_format,
-    }
-    if seed is not None:
-        payload["seed"] = int(seed)
-
-    def on_queue_update(update: Any) -> None:
-        if isinstance(update, fal_client.InProgress):
-            for log in update.logs:
-                print(log.get("message", ""))
-
-    result = fal_client.subscribe(
-        model_id,
-        arguments=payload,
-        with_logs=True,
-        on_queue_update=on_queue_update,
-    )
-    response_data = normalize_fal_result(result)
-
-    debug_path = save_json_debug(response_data, job_dir)
-    outputs_dir = job_dir / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    result_payload = response_data.get("data", response_data)
-    output_images: List[Dict[str, Any]] = []
-    for idx, image in enumerate(result_payload.get("images", []), start=1):
-        url = image.get("url")
-        if not url:
-            continue
-        mime = image.get("content_type") or "image/png"
-        ext = mime.split("/")[-1] or "png"
-        filename = f"output_{idx}.{ext}"
-        target_path = outputs_dir / filename
-        img_response = requests.get(url, timeout=60)
-        img_response.raise_for_status()
-        target_path.write_bytes(img_response.content)
-        output_images.append(
-            {
-                "path": str(target_path.relative_to(DATA_DIR)),
-                "mime_type": mime,
-                "source_url": url,
-            }
-        )
-
-    return "", output_images, debug_path
-
-
-def create_client(project: str, location: str) -> genai.Client:
-    client_kwargs: Dict[str, Any] = {"vertexai": True}
-    if project:
-        client_kwargs["project"] = project
-    if location:
-        client_kwargs["location"] = location
-    return genai.Client(**client_kwargs)
+from vertex_provider import (
+    build_config,
+    build_parts,
+    create_client,
+    parse_response,
+    save_response_debug,
+)
 
 
 def apply_history_job(job: Dict[str, Any]) -> None:
+    """Stage a history job to reapply its prompt."""
     st.session_state["pending_apply"] = {
         "prompt": job.get("prompt", ""),
     }
@@ -377,6 +32,7 @@ def apply_history_job(job: Dict[str, Any]) -> None:
 st.set_page_config(page_title="Image Editing Playground", layout="wide")
 st.title("Image Editing Playground")
 
+# Sidebar: connection and model configuration.
 with st.sidebar:
     st.header("Connection")
     st.header("Model & Settings")
@@ -432,6 +88,7 @@ with st.sidebar:
         fal_enable_safety = st.checkbox("Enable safety checker", value=True)
         fal_output_format = st.selectbox("Output format", fal_config["output_formats"], index=0)
 
+# Submit form and inputs.
 st.subheader("Submit job")
 examples = load_example_inputs()
 if examples:
@@ -460,6 +117,7 @@ if examples:
             st.session_state["example_images"] = []
             st.session_state["example_label"] = ""
 
+# Apply a prompt from history if the user clicked "Apply prompt".
 pending_apply = st.session_state.pop("pending_apply", None)
 if pending_apply:
     st.session_state["prompt_text"] = pending_apply.get("prompt", "")
@@ -492,6 +150,7 @@ with col_retry:
     submit_with_retry = st.button("Submit + retry up to 5 min", use_container_width=True)
 
 if submit or submit_with_retry:
+    # Validate inputs and build the job payload.
     can_submit = True
     seed_value = None
     input_count = len(uploads) if uploads else len(example_images)
@@ -517,6 +176,7 @@ if submit or submit_with_retry:
         can_submit = False
 
     if can_submit:
+        # Persist job metadata and prepare inputs on disk.
         job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid4().hex[:8]
         job_dir = JOBS_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -559,6 +219,7 @@ if submit or submit_with_retry:
         append_job(job_payload)
         update_job(job_id, {"status": "running"})
 
+        # Execute provider request with optional retries.
         spinner_label = "Running request on Vertex AI..." if model_choice == "gemini-3-pro-image-preview" else "Running request on fal.ai..."
         with st.spinner(spinner_label):
             attempts = 0
@@ -605,6 +266,7 @@ if submit or submit_with_retry:
                             job_dir=job_dir,
                         )
                     if submit_with_retry and not output_images:
+                        # Retry when no images are returned within the window.
                         if time.time() >= deadline:
                             update_job(
                                 job_id,
@@ -655,6 +317,7 @@ if submit or submit_with_retry:
                     update_job(job_id, {"status": "retrying", "error": last_error, "attempts": attempts})
                     time.sleep(10)
 
+# Job history display.
 st.subheader("Job history")
 history = load_history()
 
