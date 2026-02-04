@@ -21,6 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 JOBS_DIR = DATA_DIR / "jobs"
 DEFAULT_CREDENTIALS_PATH = BASE_DIR / "google_cloud.json"
+EXAMPLES_DIR = BASE_DIR / "example_inputs"
 FAL_MODELS = {
     "fal-ai/hunyuan-image/v3/instruct/edit": {
         "label": "Hunyuan Image Edit",
@@ -78,6 +79,74 @@ def save_uploaded_images(job_dir: Path, uploads: List[st.runtime.uploaded_file_m
             }
         )
     return saved
+
+
+def save_example_images(job_dir: Path, example_images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    inputs_dir = job_dir / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for image in example_images:
+        source_path = Path(image["source_path"])
+        if not source_path.exists():
+            continue
+        target_path = inputs_dir / image["filename"]
+        target_path.write_bytes(source_path.read_bytes())
+        saved.append(
+            {
+                "filename": image["filename"],
+                "path": str(target_path.relative_to(DATA_DIR)),
+                "mime_type": image["mime_type"],
+                "size_bytes": target_path.stat().st_size,
+            }
+        )
+    return saved
+
+
+def load_example_inputs() -> List[Dict[str, Any]]:
+    examples: List[Dict[str, Any]] = []
+    if not EXAMPLES_DIR.exists():
+        return examples
+    for child in sorted(EXAMPLES_DIR.iterdir()):
+        if not child.is_dir():
+            continue
+        prompt_path = child / "prompt.txt"
+        prompt_text = ""
+        if prompt_path.exists():
+            prompt_text = prompt_path.read_text(encoding="utf-8")
+        def image_sort_key(path: Path) -> Tuple[int, int, str]:
+            stem = path.stem.strip()
+            if stem.isdigit():
+                return (0, int(stem), path.name.lower())
+            return (1, 0, path.name.lower())
+
+        image_paths = [
+            path
+            for path in sorted(child.iterdir(), key=image_sort_key)
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ]
+        images = [
+            {
+                "source_path": str(path),
+                "filename": path.name,
+                "mime_type": guess_mime(path.name, "image/png"),
+            }
+            for path in image_paths
+        ]
+        examples.append(
+            {
+                "id": child.name,
+                "label": child.name,
+                "prompt": prompt_text,
+                "images": images,
+            }
+        )
+    return examples
+
+
+def apply_example_input(example: Dict[str, Any]) -> None:
+    st.session_state["prompt_text"] = example.get("prompt", "")
+    st.session_state["example_images"] = example.get("images", [])
+    st.session_state["example_label"] = example.get("label", "")
 
 
 def build_parts(prompt: str, input_images: List[Dict[str, Any]]) -> List[types.Part]:
@@ -364,6 +433,33 @@ with st.sidebar:
         fal_output_format = st.selectbox("Output format", fal_config["output_formats"], index=0)
 
 st.subheader("Submit job")
+examples = load_example_inputs()
+if examples:
+    st.write("Example inputs")
+    with st.expander("Show example inputs", expanded=False):
+        example_labels = ["(none)", *[example["label"] for example in examples]]
+        selected_label = st.selectbox("Choose example", example_labels, index=0)
+        selected_example = next((ex for ex in examples if ex["label"] == selected_label), None)
+        if selected_example:
+            if selected_example.get("prompt"):
+                st.write("Example prompt:")
+                st.code(selected_example["prompt"])
+            if selected_example.get("images"):
+                st.write("Example images:")
+                cols = st.columns(min(4, len(selected_example["images"])))
+                for idx, image in enumerate(selected_example["images"]):
+                    with cols[idx % len(cols)]:
+                        st.image(image["source_path"], caption=image["filename"])
+            st.button(
+                "Use this example",
+                key=f"use_example_{selected_example['id']}",
+                on_click=apply_example_input,
+                args=(selected_example,),
+            )
+        if st.button("Clear example selection"):
+            st.session_state["example_images"] = []
+            st.session_state["example_label"] = ""
+
 pending_apply = st.session_state.pop("pending_apply", None)
 if pending_apply:
     st.session_state["prompt_text"] = pending_apply.get("prompt", "")
@@ -378,6 +474,17 @@ uploads = st.file_uploader(
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
 )
+example_images = st.session_state.get("example_images", [])
+example_label = st.session_state.get("example_label", "")
+if example_images:
+    if uploads:
+        st.caption("Uploads are being used (example images are ignored).")
+    else:
+        st.caption(f"Using example images: {example_label}")
+        cols = st.columns(min(4, len(example_images)))
+        for idx, image in enumerate(example_images):
+            with cols[idx % len(cols)]:
+                st.image(image["source_path"], caption=image["filename"])
 col_submit, col_retry = st.columns(2)
 with col_submit:
     submit = st.button("Submit job", type="primary", use_container_width=True)
@@ -387,16 +494,17 @@ with col_retry:
 if submit or submit_with_retry:
     can_submit = True
     seed_value = None
+    input_count = len(uploads) if uploads else len(example_images)
     if model_choice in FAL_MODELS:
         if not prompt.strip():
             st.error("fal.ai requires a prompt.")
             can_submit = False
-        elif not uploads:
+        elif input_count == 0:
             st.error("fal.ai requires at least one input image.")
             can_submit = False
         else:
             max_images = FAL_MODELS[model_choice]["max_input_images"]
-            if max_images and uploads and len(uploads) > max_images:
+            if max_images and input_count > max_images:
                 st.error(f"fal.ai supports a maximum of {max_images} input images for this model.")
                 can_submit = False
             try:
@@ -414,6 +522,8 @@ if submit or submit_with_retry:
         job_dir.mkdir(parents=True, exist_ok=True)
 
         input_images = save_uploaded_images(job_dir, uploads or [])
+        if not input_images and example_images:
+            input_images = save_example_images(job_dir, example_images)
         job_payload = {
             "id": job_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
