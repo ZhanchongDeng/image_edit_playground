@@ -21,6 +21,37 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 JOBS_DIR = DATA_DIR / "jobs"
 DEFAULT_CREDENTIALS_PATH = BASE_DIR / "google_cloud.json"
+FAL_MODELS = {
+    "fal-ai/hunyuan-image/v3/instruct/edit": {
+        "label": "Hunyuan Image Edit",
+        "image_sizes": [
+            "auto",
+            "square_hd",
+            "square",
+            "portrait_4_3",
+            "portrait_16_9",
+            "landscape_4_3",
+            "landscape_16_9",
+        ],
+        "output_formats": ["png", "jpeg"],
+        "guidance_default": 3.5,
+        "max_input_images": 2,
+    },
+    "fal-ai/qwen-image-edit-2511": {
+        "label": "Qwen Image Edit 2511",
+        "image_sizes": [
+            "square_hd",
+            "square",
+            "portrait_4_3",
+            "portrait_16_9",
+            "landscape_4_3",
+            "landscape_16_9",
+        ],
+        "output_formats": ["png", "jpeg", "webp"],
+        "guidance_default": 4.5,
+        "max_input_images": None,
+    },
+}
 
 
 def guess_mime(filename: str, default: str = "application/octet-stream") -> str:
@@ -187,6 +218,7 @@ def normalize_fal_result(result: Any) -> Dict[str, Any]:
 
 
 def run_fal_instruct_edit(
+    model_id: str,
     prompt: str,
     input_images: List[Dict[str, Any]],
     image_size: str,
@@ -224,7 +256,7 @@ def run_fal_instruct_edit(
                 print(log.get("message", ""))
 
     result = fal_client.subscribe(
-        "fal-ai/hunyuan-image/v3/instruct/edit",
+        model_id,
         arguments=payload,
         with_logs=True,
         on_queue_update=on_queue_update,
@@ -281,7 +313,7 @@ with st.sidebar:
     st.header("Model & Settings")
     model_choice = st.selectbox(
         "Model",
-        ["gemini-3-pro-image-preview", "fal-ai/hunyuan-image/v3/instruct/edit"],
+        ["gemini-3-pro-image-preview", *FAL_MODELS.keys()],
         index=0,
     )
 
@@ -308,6 +340,7 @@ with st.sidebar:
         output_mime_type = st.selectbox("Output mime type", ["image/png", "image/jpeg", "image/webp"], index=0)
     else:
         st.markdown("fal.ai requires `FAL_KEY` to be set in the environment.")
+        fal_config = FAL_MODELS[model_choice]
         fal_key_input = st.text_input(
             "FAL_KEY (optional)",
             value=os.environ.get("FAL_KEY", ""),
@@ -315,22 +348,20 @@ with st.sidebar:
         )
         fal_image_size = st.selectbox(
             "Image size",
-            [
-                "auto",
-                "square_hd",
-                "square",
-                "portrait_4_3",
-                "portrait_16_9",
-                "landscape_4_3",
-                "landscape_16_9",
-            ],
+            fal_config["image_sizes"],
             index=0,
         )
         fal_num_images = st.number_input("Num images", min_value=1, max_value=4, value=1)
-        fal_guidance_scale = st.slider("Guidance scale", min_value=0.0, max_value=20.0, value=3.5, step=0.1)
+        fal_guidance_scale = st.slider(
+            "Guidance scale",
+            min_value=0.0,
+            max_value=20.0,
+            value=float(fal_config["guidance_default"]),
+            step=0.1,
+        )
         fal_seed_text = st.text_input("Seed (optional)", value="")
         fal_enable_safety = st.checkbox("Enable safety checker", value=True)
-        fal_output_format = st.selectbox("Output format", ["png", "jpeg"], index=0)
+        fal_output_format = st.selectbox("Output format", fal_config["output_formats"], index=0)
 
 st.subheader("Submit job")
 pending_apply = st.session_state.pop("pending_apply", None)
@@ -356,17 +387,18 @@ with col_retry:
 if submit or submit_with_retry:
     can_submit = True
     seed_value = None
-    if model_choice == "fal-ai/hunyuan-image/v3/instruct/edit":
+    if model_choice in FAL_MODELS:
         if not prompt.strip():
             st.error("fal.ai requires a prompt.")
             can_submit = False
         elif not uploads:
             st.error("fal.ai requires at least one input image.")
             can_submit = False
-        elif uploads and len(uploads) > 2:
-            st.error("fal.ai supports a maximum of 2 input images.")
-            can_submit = False
         else:
+            max_images = FAL_MODELS[model_choice]["max_input_images"]
+            if max_images and uploads and len(uploads) > max_images:
+                st.error(f"fal.ai supports a maximum of {max_images} input images for this model.")
+                can_submit = False
             try:
                 seed_value = parse_optional_int(fal_seed_text)
             except ValueError as exc:
@@ -406,6 +438,7 @@ if submit or submit_with_retry:
             }
         else:
             job_payload["settings"] = {
+                "model_id": model_choice,
                 "image_size": fal_image_size,
                 "num_images": int(fal_num_images),
                 "guidance_scale": float(fal_guidance_scale),
@@ -450,6 +483,7 @@ if submit or submit_with_retry:
                         if fal_key_input:
                             os.environ["FAL_KEY"] = fal_key_input
                         output_text, output_images, debug_path = run_fal_instruct_edit(
+                            model_id=model_choice,
                             prompt=prompt,
                             input_images=input_images,
                             image_size=fal_image_size,

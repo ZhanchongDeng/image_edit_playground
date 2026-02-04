@@ -27,7 +27,7 @@ export GOOGLE_CLOUD_PROJECT="YOUR_PROJECT"   # optional
 export GOOGLE_CLOUD_LOCATION="us-central1"   # optional
 ```
 
-4. If using fal.ai Hunyuan Image, set the API key:
+4. If using fal.ai (Hunyuan or Qwen Image Edit), set the API key:
 
 ```
 export FAL_KEY="YOUR_FAL_KEY"
