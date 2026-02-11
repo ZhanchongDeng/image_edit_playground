@@ -21,6 +21,9 @@ env/
 # App data
 data/
 example_inputs/
+outputs/
+multi_view_lora_train/
+
 
 # Credentials
 google_cloud.json

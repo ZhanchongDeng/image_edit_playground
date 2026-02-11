@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import fal_client
 
-from config import DATA_DIR
+from config import DATA_DIR, FAL_MODELS
 from io_utils import build_data_uri
 
 
@@ -46,7 +46,7 @@ def save_json_debug(data: Dict[str, Any], job_dir: Path) -> str:
     return str(target_path.relative_to(DATA_DIR))
 
 
-def run_fal_instruct_edit(
+def build_fal_payload(
     model_id: str,
     prompt: str,
     input_images: List[Dict[str, Any]],
@@ -56,17 +56,34 @@ def run_fal_instruct_edit(
     seed: Optional[int],
     enable_safety_checker: bool,
     output_format: str,
-    job_dir: Path,
-) -> Tuple[str, List[Dict[str, Any]], str]:
-    """Run fal.ai instruct edit and store returned images."""
-    fal_key = os.environ.get("FAL_KEY", "")
-    if not fal_key:
-        raise RuntimeError("FAL_KEY environment variable is required for fal.ai requests.")
+) -> Dict[str, Any]:
+    """Create the fal.ai request payload for a model."""
+    model_config = FAL_MODELS.get(model_id, {})
+    payload_type = model_config.get("payload_type", "instruct_edit")
 
     image_urls = []
     for image in input_images:
+        if image.get("url"):
+            image_urls.append(image["url"])
+            continue
         image_path = DATA_DIR / image["path"]
         image_urls.append(build_data_uri(image_path, image["mime_type"]))
+
+    if payload_type == "nano_banana_edit":
+        payload = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "num_images": int(num_images),
+        }
+        if model_config.get("supports_output_format"):
+            payload["output_format"] = output_format
+        return payload
+
+    if payload_type == "gemini_flash_edit_multi":
+        return {
+            "prompt": prompt,
+            "input_image_urls": image_urls,
+        }
 
     payload = {
         "prompt": prompt,
@@ -79,6 +96,37 @@ def run_fal_instruct_edit(
     }
     if seed is not None:
         payload["seed"] = int(seed)
+    return payload
+
+
+def run_fal_request(
+    model_id: str,
+    prompt: str,
+    input_images: List[Dict[str, Any]],
+    image_size: str,
+    num_images: int,
+    guidance_scale: float,
+    seed: Optional[int],
+    enable_safety_checker: bool,
+    output_format: str,
+    job_dir: Path,
+) -> Tuple[str, List[Dict[str, Any]], str]:
+    """Run fal.ai request and store returned images."""
+    fal_key = os.environ.get("FAL_KEY", "")
+    if not fal_key:
+        raise RuntimeError("FAL_KEY environment variable is required for fal.ai requests.")
+
+    payload = build_fal_payload(
+        model_id=model_id,
+        prompt=prompt,
+        input_images=input_images,
+        image_size=image_size,
+        num_images=num_images,
+        guidance_scale=guidance_scale,
+        seed=seed,
+        enable_safety_checker=enable_safety_checker,
+        output_format=output_format,
+    )
 
     def on_queue_update(update: Any) -> None:
         if isinstance(update, fal_client.InProgress):
@@ -96,9 +144,15 @@ def run_fal_instruct_edit(
     debug_path = save_json_debug(response_data, job_dir)
     outputs_dir = job_dir / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    params_path = outputs_dir / "params.json"
+    params_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     result_payload = response_data.get("data", response_data)
+    output_text = result_payload.get("description", "")
     output_images: List[Dict[str, Any]] = []
-    for idx, image in enumerate(result_payload.get("images", []), start=1):
+    images_payload = result_payload.get("images")
+    if images_payload is None and isinstance(result_payload.get("image"), dict):
+        images_payload = [result_payload["image"]]
+    for idx, image in enumerate(images_payload or [], start=1):
         url = image.get("url")
         if not url:
             continue
@@ -117,4 +171,4 @@ def run_fal_instruct_edit(
             }
         )
 
-    return "", output_images, debug_path
+    return output_text, output_images, debug_path

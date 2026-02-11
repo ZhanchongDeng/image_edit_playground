@@ -2,15 +2,16 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import streamlit as st
 from google.genai import types
 
-from config import DATA_DIR, DEFAULT_CREDENTIALS_PATH, FAL_MODELS, JOBS_DIR
+from config import DATA_DIR, DEFAULT_CREDENTIALS_PATH, FAL_MODELS, JOBS_DIR, VERTEX_MODELS
 from examples import apply_example_input, load_example_inputs
-from fal_provider import parse_optional_int, run_fal_instruct_edit
+from fal_provider import parse_optional_int, run_fal_request
 from io_utils import save_example_images, save_uploaded_images
 from storage import append_job, load_history, update_job
 from vertex_provider import (
@@ -29,6 +30,21 @@ def apply_history_job(job: Dict[str, Any]) -> None:
     }
 
 
+def parse_image_urls(raw_text: str) -> List[Dict[str, Any]]:
+    """Parse user-entered image URLs into job payload entries."""
+    urls: List[Dict[str, Any]] = []
+    for line in raw_text.splitlines():
+        url = line.strip()
+        if not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError(f"Invalid URL: {url}")
+        parsed = urlparse(url)
+        filename = Path(parsed.path).name or "remote_image"
+        urls.append({"url": url, "filename": filename})
+    return urls
+
+
 st.set_page_config(page_title="Image Editing Playground", layout="wide")
 st.title("Image Editing Playground")
 
@@ -36,13 +52,9 @@ st.title("Image Editing Playground")
 with st.sidebar:
     st.header("Connection")
     st.header("Model & Settings")
-    model_choice = st.selectbox(
-        "Model",
-        ["gemini-3-pro-image-preview", *FAL_MODELS.keys()],
-        index=0,
-    )
+    model_choice = st.selectbox("Model", [*VERTEX_MODELS, *FAL_MODELS.keys()], index=0)
 
-    if model_choice == "gemini-3-pro-image-preview":
+    if model_choice in VERTEX_MODELS:
         st.markdown("Vertex AI requires OAuth2/ADC credentials (API keys are not supported).")
         credentials_path = st.text_input(
             "GOOGLE_APPLICATION_CREDENTIALS (optional)",
@@ -71,22 +83,34 @@ with st.sidebar:
             value=os.environ.get("FAL_KEY", ""),
             type="password",
         )
-        fal_image_size = st.selectbox(
-            "Image size",
-            fal_config["image_sizes"],
-            index=0,
-        )
-        fal_num_images = st.number_input("Num images", min_value=1, max_value=4, value=1)
-        fal_guidance_scale = st.slider(
-            "Guidance scale",
-            min_value=0.0,
-            max_value=20.0,
-            value=float(fal_config["guidance_default"]),
-            step=0.1,
-        )
-        fal_seed_text = st.text_input("Seed (optional)", value="")
-        fal_enable_safety = st.checkbox("Enable safety checker", value=True)
-        fal_output_format = st.selectbox("Output format", fal_config["output_formats"], index=0)
+        fal_image_size = None
+        if fal_config.get("supports_image_size"):
+            fal_image_size = st.selectbox(
+                "Image size",
+                fal_config["image_sizes"],
+                index=0,
+            )
+        fal_num_images = 1
+        if fal_config.get("supports_num_images"):
+            fal_num_images = st.number_input("Num images", min_value=1, max_value=4, value=1)
+        fal_guidance_scale = 0.0
+        if fal_config.get("supports_guidance_scale"):
+            fal_guidance_scale = st.slider(
+                "Guidance scale",
+                min_value=0.0,
+                max_value=20.0,
+                value=float(fal_config["guidance_default"]),
+                step=0.1,
+            )
+        fal_seed_text = ""
+        if fal_config.get("supports_seed"):
+            fal_seed_text = st.text_input("Seed (optional)", value="")
+        fal_enable_safety = False
+        if fal_config.get("supports_safety_checker"):
+            fal_enable_safety = st.checkbox("Enable safety checker", value=True)
+        fal_output_format = "png"
+        if fal_config.get("supports_output_format"):
+            fal_output_format = st.selectbox("Output format", fal_config["output_formats"], index=0)
 
 # Submit form and inputs.
 st.subheader("Submit job")
@@ -132,6 +156,10 @@ uploads = st.file_uploader(
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
 )
+url_text = st.text_area(
+    "Input image URLs (one per line)",
+    placeholder="https://example.com/image.png",
+)
 example_images = st.session_state.get("example_images", [])
 example_label = st.session_state.get("example_label", "")
 if example_images:
@@ -153,7 +181,14 @@ if submit or submit_with_retry:
     # Validate inputs and build the job payload.
     can_submit = True
     seed_value = None
+    url_images: List[Dict[str, Any]] = []
+    try:
+        url_images = parse_image_urls(url_text)
+    except ValueError as exc:
+        st.error(str(exc))
+        can_submit = False
     input_count = len(uploads) if uploads else len(example_images)
+    input_count += len(url_images)
     if model_choice in FAL_MODELS:
         if not prompt.strip():
             st.error("fal.ai requires a prompt.")
@@ -171,7 +206,10 @@ if submit or submit_with_retry:
             except ValueError as exc:
                 st.error(str(exc))
                 can_submit = False
-    elif not prompt and not uploads:
+    elif url_images:
+        st.error("Image URLs are only supported for fal.ai models.")
+        can_submit = False
+    elif model_choice in VERTEX_MODELS and not prompt and not uploads:
         st.error("Add a prompt or at least one image.")
         can_submit = False
 
@@ -184,19 +222,20 @@ if submit or submit_with_retry:
         input_images = save_uploaded_images(job_dir, uploads or [])
         if not input_images and example_images:
             input_images = save_example_images(job_dir, example_images)
+        input_images.extend(url_images)
         job_payload = {
             "id": job_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "status": "queued",
             "prompt": prompt,
             "model": model_choice,
-            "provider": "vertex" if model_choice == "gemini-3-pro-image-preview" else "fal",
+            "provider": "vertex" if model_choice in VERTEX_MODELS else "fal",
             "settings": {},
             "input_images": input_images,
             "outputs": {"text": "", "images": []},
             "error": "",
         }
-        if model_choice == "gemini-3-pro-image-preview":
+        if model_choice in VERTEX_MODELS:
             job_payload["settings"] = {
                 "temperature": temperature,
                 "top_p": top_p,
@@ -220,7 +259,7 @@ if submit or submit_with_retry:
         update_job(job_id, {"status": "running"})
 
         # Execute provider request with optional retries.
-        spinner_label = "Running request on Vertex AI..." if model_choice == "gemini-3-pro-image-preview" else "Running request on fal.ai..."
+        spinner_label = "Running request on Vertex AI..." if model_choice in VERTEX_MODELS else "Running request on fal.ai..."
         with st.spinner(spinner_label):
             attempts = 0
             deadline = time.time() + (5 * 60 if submit_with_retry else 0)
@@ -228,7 +267,7 @@ if submit or submit_with_retry:
             while True:
                 attempts += 1
                 try:
-                    if model_choice == "gemini-3-pro-image-preview":
+                    if model_choice in VERTEX_MODELS:
                         if credentials_path:
                             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
                         client = create_client(project, location)
@@ -253,11 +292,11 @@ if submit or submit_with_retry:
                     else:
                         if fal_key_input:
                             os.environ["FAL_KEY"] = fal_key_input
-                        output_text, output_images, debug_path = run_fal_instruct_edit(
+                        output_text, output_images, debug_path = run_fal_request(
                             model_id=model_choice,
                             prompt=prompt,
                             input_images=input_images,
-                            image_size=fal_image_size,
+                            image_size=fal_image_size or "auto",
                             num_images=int(fal_num_images),
                             guidance_scale=float(fal_guidance_scale),
                             seed=seed_value,
@@ -354,8 +393,21 @@ else:
                 st.write("Input images:")
                 cols = st.columns(min(4, len(job["input_images"])))
                 for idx, image in enumerate(job["input_images"]):
-                    image_path = DATA_DIR / image["path"]
                     with cols[idx % len(cols)]:
+                        if isinstance(image, str):
+                            if image.startswith("http://") or image.startswith("https://"):
+                                st.image(image, caption="URL image")
+                            else:
+                                image_path = DATA_DIR / image
+                                if image_path.exists():
+                                    st.image(str(image_path))
+                                else:
+                                    st.text(image)
+                            continue
+                        if image.get("url"):
+                            st.image(image["url"], caption=image.get("filename", "URL image"))
+                            continue
+                        image_path = DATA_DIR / image["path"]
                         if image_path.exists():
                             st.image(str(image_path), caption=image["filename"])
                         else:
