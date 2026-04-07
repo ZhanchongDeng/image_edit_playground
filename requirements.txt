@@ -2,3 +2,4 @@ streamlit
 google-genai
 fal-client
 requests
+Pillow

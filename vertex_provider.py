@@ -1,15 +1,30 @@
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from google import genai
 from google.genai import types
+from google.oauth2 import service_account
 
 from config import DATA_DIR
 
+VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
-def create_client(project: str, location: str) -> genai.Client:
-    """Create a Vertex AI client for image generation."""
+
+def create_client(
+    project: str, location: str, credentials_path: Optional[str] = None
+) -> genai.Client:
+    """Create a Vertex AI client with explicit service-account credentials."""
+    creds_file = credentials_path or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     client_kwargs: Dict[str, Any] = {"vertexai": True}
+    if creds_file and Path(creds_file).is_file():
+        creds = service_account.Credentials.from_service_account_file(
+            creds_file, scopes=VERTEX_SCOPES
+        )
+        client_kwargs["credentials"] = creds
+        if not project:
+            project = creds.project_id
     if project:
         client_kwargs["project"] = project
     if location:
@@ -18,11 +33,20 @@ def create_client(project: str, location: str) -> genai.Client:
 
 
 def build_parts(prompt: str, input_images: List[Dict[str, Any]]) -> List[types.Part]:
-    """Build Vertex AI content parts from prompt and images."""
+    """Build Vertex AI content parts from prompt and images (local paths or http(s) URLs)."""
     parts: List[types.Part] = []
     if prompt.strip():
         parts.append(types.Part.from_text(text=prompt))
     for image in input_images:
+        if image.get("url"):
+            resp = requests.get(image["url"], timeout=60)
+            resp.raise_for_status()
+            mime = (image.get("mime_type") or "").strip()
+            if not mime:
+                mime = resp.headers.get("Content-Type", "image/png")
+                mime = mime.split(";")[0].strip() or "image/png"
+            parts.append(types.Part.from_bytes(data=resp.content, mime_type=mime))
+            continue
         image_path = DATA_DIR / image["path"]
         image_bytes = image_path.read_bytes()
         parts.append(

@@ -55,3 +55,4 @@ def apply_example_input(example: Dict[str, Any]) -> None:
     st.session_state["prompt_text"] = example.get("prompt", "")
     st.session_state["example_images"] = example.get("images", [])
     st.session_state["example_label"] = example.get("label", "")
+    st.session_state["image_urls_text"] = ""

@@ -9,9 +9,10 @@ from uuid import uuid4
 import streamlit as st
 from google.genai import types
 
-from config import DATA_DIR, DEFAULT_CREDENTIALS_PATH, FAL_MODELS, JOBS_DIR, VERTEX_MODELS
+from config import BFL_MODELS, DATA_DIR, DEFAULT_CREDENTIALS_PATH, FAL_MODELS, JOBS_DIR, VERTEX_MODELS
 from examples import apply_example_input, load_example_inputs
-from fal_provider import parse_optional_int, run_fal_request
+from bfl_provider import run_bfl_request
+from fal_provider import parse_optional_int, run_fal_request, upload_local_images_to_fal
 from io_utils import save_example_images, save_uploaded_images
 from storage import append_job, load_history, update_job
 from vertex_provider import (
@@ -24,9 +25,16 @@ from vertex_provider import (
 
 
 def apply_history_job(job: Dict[str, Any]) -> None:
-    """Stage a history job to reapply its prompt."""
+    """Stage a history job to reapply its prompt and image URLs."""
+    url_lines: List[str] = []
+    for im in job.get("input_images") or []:
+        if isinstance(im, str) and (im.startswith("http://") or im.startswith("https://")):
+            url_lines.append(im)
+        elif isinstance(im, dict) and im.get("url"):
+            url_lines.append(str(im["url"]))
     st.session_state["pending_apply"] = {
         "prompt": job.get("prompt", ""),
+        "image_urls": "\n".join(url_lines),
     }
 
 
@@ -51,8 +59,18 @@ st.title("Image Editing Playground")
 # Sidebar: connection and model configuration.
 with st.sidebar:
     st.header("Connection")
+    fal_key_input = st.text_input(
+        "FAL_KEY (optional)",
+        value=os.environ.get("FAL_KEY", ""),
+        type="password",
+        help="Required for fal.ai. Also used to turn file uploads into fal-hosted URLs so job history can re-apply image links.",
+    )
     st.header("Model & Settings")
-    model_choice = st.selectbox("Model", [*VERTEX_MODELS, *FAL_MODELS.keys()], index=0)
+    model_choice = st.selectbox(
+        "Model",
+        [*VERTEX_MODELS, *FAL_MODELS.keys(), *BFL_MODELS.keys()],
+        index=0,
+    )
 
     if model_choice in VERTEX_MODELS:
         st.markdown("Vertex AI requires OAuth2/ADC credentials (API keys are not supported).")
@@ -75,19 +93,71 @@ with st.sidebar:
         aspect_ratio = st.selectbox("Aspect ratio", ["1:1", "4:3", "3:4", "16:9", "9:16"], index=0)
         image_size = st.selectbox("Image size", ["256", "512", "1K", "2K"], index=2)
         output_mime_type = st.selectbox("Output mime type", ["image/png", "image/jpeg", "image/webp"], index=0)
-    else:
-        st.markdown("fal.ai requires `FAL_KEY` to be set in the environment.")
-        fal_config = FAL_MODELS[model_choice]
-        fal_key_input = st.text_input(
-            "FAL_KEY (optional)",
-            value=os.environ.get("FAL_KEY", ""),
+    elif model_choice in BFL_MODELS:
+        st.markdown(
+            "BFL Labs partner endpoints require `BFL_API_KEY` (project-specific; not your fal.ai key). "
+            "Export it in your shell before `streamlit run`, or paste it below."
+        )
+        bfl_config = BFL_MODELS[model_choice]
+        bfl_key_input = st.text_input(
+            "BFL_API_KEY (optional)",
+            value=os.environ.get("BFL_API_KEY", ""),
             type="password",
         )
+        bfl_image_size = None
+        if bfl_config.get("image_sizes"):
+            bfl_image_size = st.selectbox(
+                "Image size",
+                bfl_config["image_sizes"],
+                index=0,
+            )
+        bfl_seed_text = ""
+        if bfl_config.get("supports_seed"):
+            bfl_seed_text = st.text_input("Seed (optional)", value="")
+        bfl_prompt_upsampling = False
+        if bfl_config.get("supports_prompt_upsampling"):
+            bfl_prompt_upsampling = st.checkbox(
+                "Prompt upsampling",
+                value=bool(bfl_config.get("prompt_upsampling_default", False)),
+            )
+        bfl_safety_tolerance = None
+        if bfl_config.get("supports_safety_tolerance"):
+            safety_levels = bfl_config["safety_tolerance_levels"]
+            default_level = bfl_config.get("safety_tolerance_default", safety_levels[0])
+            default_index = safety_levels.index(default_level) if default_level in safety_levels else 0
+            bfl_safety_tolerance = st.selectbox(
+                "Safety tolerance",
+                safety_levels,
+                index=default_index,
+            )
+        st.caption(
+            "Upload order: first image = person/model; following images = garment/reference "
+            "(up to 10 images total, per FLUX.2 Pro API)."
+        )
+    else:
+        st.markdown("fal.ai requires `FAL_KEY` (set in Connection above or your environment).")
+        fal_config = FAL_MODELS[model_choice]
+        fal_num_inference_steps = None
+        fal_enable_thinking = None
         fal_image_size = None
         if fal_config.get("supports_image_size"):
             fal_image_size = st.selectbox(
                 "Image size",
                 fal_config["image_sizes"],
+                index=0,
+            )
+        fal_aspect_ratio = None
+        if fal_config.get("supports_aspect_ratio"):
+            fal_aspect_ratio = st.selectbox(
+                "Aspect ratio",
+                fal_config["aspect_ratios"],
+                index=0,
+            )
+        fal_resolution = None
+        if fal_config.get("supports_resolution"):
+            fal_resolution = st.selectbox(
+                "Resolution",
+                fal_config["resolutions"],
                 index=0,
             )
         fal_num_images = 1
@@ -108,9 +178,58 @@ with st.sidebar:
         fal_enable_safety = False
         if fal_config.get("supports_safety_checker"):
             fal_enable_safety = st.checkbox("Enable safety checker", value=True)
+        fal_safety_tolerance = None
+        if fal_config.get("supports_safety_tolerance"):
+            safety_levels = fal_config["safety_tolerance_levels"]
+            default_level = fal_config.get("safety_tolerance_default", safety_levels[0])
+            default_index = safety_levels.index(default_level) if default_level in safety_levels else 0
+            fal_safety_tolerance = st.selectbox(
+                "Safety tolerance",
+                safety_levels,
+                index=default_index,
+            )
+        fal_sync_mode = False
+        if fal_config.get("supports_sync_mode"):
+            fal_sync_mode = st.checkbox("Sync mode (return data URIs)", value=False)
+        fal_limit_generations = None
+        if fal_config.get("supports_limit_generations"):
+            fal_limit_generations = st.checkbox(
+                "Limit generations",
+                value=bool(fal_config.get("limit_generations_default", True)),
+            )
+        fal_enable_web_search = False
+        if fal_config.get("supports_enable_web_search"):
+            fal_enable_web_search = st.checkbox("Enable web search", value=False)
+        fal_background = None
+        if fal_config.get("supports_background"):
+            fal_background = st.selectbox("Background", fal_config["backgrounds"], index=0)
+        fal_quality = None
+        if fal_config.get("supports_quality"):
+            quality_options = fal_config["qualities"]
+            quality_default = fal_config.get("quality_default", quality_options[0])
+            quality_index = quality_options.index(quality_default) if quality_default in quality_options else 0
+            fal_quality = st.selectbox("Quality", quality_options, index=quality_index)
+        fal_input_fidelity = None
+        if fal_config.get("supports_input_fidelity"):
+            fidelity_options = fal_config["input_fidelities"]
+            fidelity_default = fal_config.get("input_fidelity_default", fidelity_options[0])
+            fidelity_index = fidelity_options.index(fidelity_default) if fidelity_default in fidelity_options else 0
+            fal_input_fidelity = st.selectbox("Input fidelity", fidelity_options, index=fidelity_index)
         fal_output_format = "png"
         if fal_config.get("supports_output_format"):
             fal_output_format = st.selectbox("Output format", fal_config["output_formats"], index=0)
+        if fal_config.get("supports_num_inference_steps"):
+            fal_num_inference_steps = st.number_input(
+                "Num inference steps",
+                min_value=1,
+                max_value=150,
+                value=int(fal_config.get("num_inference_steps_default", 30)),
+            )
+        if fal_config.get("supports_enable_thinking"):
+            fal_enable_thinking = st.checkbox(
+                "Enable thinking mode",
+                value=bool(fal_config.get("enable_thinking_default", True)),
+            )
 
 # Submit form and inputs.
 st.subheader("Submit job")
@@ -145,6 +264,9 @@ if examples:
 pending_apply = st.session_state.pop("pending_apply", None)
 if pending_apply:
     st.session_state["prompt_text"] = pending_apply.get("prompt", "")
+    st.session_state["image_urls_text"] = pending_apply.get("image_urls", "")
+    st.session_state["example_images"] = []
+    st.session_state["example_label"] = ""
 prompt = st.text_area(
     "Prompt",
     height=140,
@@ -159,6 +281,7 @@ uploads = st.file_uploader(
 url_text = st.text_area(
     "Input image URLs (one per line)",
     placeholder="https://example.com/image.png",
+    key="image_urls_text",
 )
 example_images = st.session_state.get("example_images", [])
 example_label = st.session_state.get("example_label", "")
@@ -189,7 +312,29 @@ if submit or submit_with_retry:
         can_submit = False
     input_count = len(uploads) if uploads else len(example_images)
     input_count += len(url_images)
-    if model_choice in FAL_MODELS:
+    if model_choice in BFL_MODELS:
+        if not prompt.strip():
+            st.error("BFL Labs requires a prompt.")
+            can_submit = False
+        elif input_count == 0:
+            st.error("BFL Labs requires input images.")
+            can_submit = False
+        else:
+            bfl_cfg = BFL_MODELS[model_choice]
+            min_im = bfl_cfg.get("min_input_images")
+            max_im = bfl_cfg.get("max_input_images")
+            if min_im and input_count < min_im:
+                st.error(f"This BFL model requires at least {min_im} input images (in order).")
+                can_submit = False
+            if max_im and input_count > max_im:
+                st.error(f"This BFL model supports at most {max_im} input images.")
+                can_submit = False
+            try:
+                seed_value = parse_optional_int(bfl_seed_text)
+            except ValueError as exc:
+                st.error(str(exc))
+                can_submit = False
+    elif model_choice in FAL_MODELS:
         if not prompt.strip():
             st.error("fal.ai requires a prompt.")
             can_submit = False
@@ -206,12 +351,10 @@ if submit or submit_with_retry:
             except ValueError as exc:
                 st.error(str(exc))
                 can_submit = False
-    elif url_images:
-        st.error("Image URLs are only supported for fal.ai models.")
-        can_submit = False
-    elif model_choice in VERTEX_MODELS and not prompt and not uploads:
-        st.error("Add a prompt or at least one image.")
-        can_submit = False
+    elif model_choice in VERTEX_MODELS:
+        if not prompt.strip() and input_count == 0:
+            st.error("Add a prompt or at least one image.")
+            can_submit = False
 
     if can_submit:
         # Persist job metadata and prepare inputs on disk.
@@ -220,6 +363,8 @@ if submit or submit_with_retry:
         job_dir.mkdir(parents=True, exist_ok=True)
 
         input_images = save_uploaded_images(job_dir, uploads or [])
+        if uploads and input_images:
+            input_images = upload_local_images_to_fal(input_images, fal_key=fal_key_input)
         if not input_images and example_images:
             input_images = save_example_images(job_dir, example_images)
         input_images.extend(url_images)
@@ -229,7 +374,11 @@ if submit or submit_with_retry:
             "status": "queued",
             "prompt": prompt,
             "model": model_choice,
-            "provider": "vertex" if model_choice in VERTEX_MODELS else "fal",
+            "provider": (
+                "vertex"
+                if model_choice in VERTEX_MODELS
+                else ("bfl" if model_choice in BFL_MODELS else "fal")
+            ),
             "settings": {},
             "input_images": input_images,
             "outputs": {"text": "", "images": []},
@@ -245,21 +394,45 @@ if submit or submit_with_retry:
                 "image_size": image_size,
                 "output_mime_type": output_mime_type,
             }
+        elif model_choice in BFL_MODELS:
+            job_payload["settings"] = {
+                "model_id": model_choice,
+                "image_size": bfl_image_size,
+                "seed": seed_value,
+                "prompt_upsampling": bfl_prompt_upsampling,
+                "safety_tolerance": bfl_safety_tolerance,
+            }
         else:
             job_payload["settings"] = {
                 "model_id": model_choice,
                 "image_size": fal_image_size,
+                "aspect_ratio": fal_aspect_ratio,
+                "resolution": fal_resolution,
                 "num_images": int(fal_num_images),
                 "guidance_scale": float(fal_guidance_scale),
                 "seed": seed_value,
                 "enable_safety_checker": fal_enable_safety,
+                "safety_tolerance": fal_safety_tolerance,
+                "sync_mode": fal_sync_mode,
+                "limit_generations": fal_limit_generations,
+                "enable_web_search": fal_enable_web_search,
                 "output_format": fal_output_format,
+                "background": fal_background,
+                "quality": fal_quality,
+                "input_fidelity": fal_input_fidelity,
+                "num_inference_steps": fal_num_inference_steps,
+                "enable_thinking": fal_enable_thinking,
             }
         append_job(job_payload)
         update_job(job_id, {"status": "running"})
 
         # Execute provider request with optional retries.
-        spinner_label = "Running request on Vertex AI..." if model_choice in VERTEX_MODELS else "Running request on fal.ai..."
+        if model_choice in VERTEX_MODELS:
+            spinner_label = "Running request on Vertex AI..."
+        elif model_choice in BFL_MODELS:
+            spinner_label = "Running request on BFL Labs..."
+        else:
+            spinner_label = "Running request on fal.ai..."
         with st.spinner(spinner_label):
             attempts = 0
             deadline = time.time() + (5 * 60 if submit_with_retry else 0)
@@ -268,9 +441,7 @@ if submit or submit_with_retry:
                 attempts += 1
                 try:
                     if model_choice in VERTEX_MODELS:
-                        if credentials_path:
-                            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
-                        client = create_client(project, location)
+                        client = create_client(project, location, credentials_path)
                         parts = build_parts(prompt, input_images)
                         contents = [types.Content(role="user", parts=parts)]
                         config = build_config(
@@ -289,6 +460,19 @@ if submit or submit_with_retry:
                         )
                         debug_path = save_response_debug(response, job_dir)
                         output_text, output_images = parse_response(response, job_dir)
+                    elif model_choice in BFL_MODELS:
+                        if bfl_key_input:
+                            os.environ["BFL_API_KEY"] = bfl_key_input
+                        output_text, output_images, debug_path = run_bfl_request(
+                            model_id=model_choice,
+                            prompt=prompt,
+                            input_images=input_images,
+                            image_size=bfl_image_size,
+                            seed=seed_value,
+                            prompt_upsampling=bfl_prompt_upsampling,
+                            safety_tolerance=bfl_safety_tolerance or "3",
+                            job_dir=job_dir,
+                        )
                     else:
                         if fal_key_input:
                             os.environ["FAL_KEY"] = fal_key_input
@@ -297,12 +481,23 @@ if submit or submit_with_retry:
                             prompt=prompt,
                             input_images=input_images,
                             image_size=fal_image_size or "auto",
+                            aspect_ratio=fal_aspect_ratio,
+                            resolution=fal_resolution,
                             num_images=int(fal_num_images),
                             guidance_scale=float(fal_guidance_scale),
                             seed=seed_value,
                             enable_safety_checker=fal_enable_safety,
+                            safety_tolerance=fal_safety_tolerance,
+                            sync_mode=fal_sync_mode,
+                            limit_generations=fal_limit_generations,
+                            enable_web_search=fal_enable_web_search,
                             output_format=fal_output_format,
                             job_dir=job_dir,
+                            background=fal_background,
+                            quality=fal_quality,
+                            input_fidelity=fal_input_fidelity,
+                            num_inference_steps=fal_num_inference_steps,
+                            enable_thinking=fal_enable_thinking,
                         )
                     if submit_with_retry and not output_images:
                         # Retry when no images are returned within the window.
